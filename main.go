@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -80,22 +81,36 @@ func handleConnection(conn net.Conn, dbpool *pgxpool.Pool) {
 			break
 		}
 
-		// Clean up string and parse to float
+		// Clean up string and parse to float and string
 		line = strings.TrimSpace(line)
-		var metric float64
-		_, err = fmt.Sscanf(line, "%f", &metric)
-		if err != nil {
-			log.Printf("[%s] Data parsing error: %v", clientAddr, err)
+		if line == "" {
+			continue // Skip empty heartbeats or ghost newlines
+		}
+
+		// Split the line by space: ["15.50", "user@email.com"]
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			log.Printf("[%s] Malformed data: %s", clientAddr, line)
 			continue
 		}
 
+		metric, err := strconv.ParseFloat(parts[0], 64)
+		if err != nil {
+			log.Printf("[%s] Error parsing CPU value: %v", clientAddr, err)
+			continue
+		}
+
+		email := parts[1]
+		agentName := parts[2]
+		agentType := parts[3]
+
 		// Save to TimescaleDB (INSERT DATA)
-		query := `INSERT INTO rihno_metrics (time, agent_id, cpu_usage) VALUES ($1, $2, $3)`
-		_, err = dbpool.Exec(context.Background(), query, time.Now(), clientAddr, metric)
+		query := `INSERT INTO rihno_metrics (time, agent_id, cpu_usage, email, agent_name, agent_type) VALUES ($1, $2, $3, $4, $5, $6)`
+		_, err = dbpool.Exec(context.Background(), query, time.Now(), clientAddr, metric, email, agentName, agentType)
 		if err != nil {
 			log.Printf("Database insert error: %v", err)
 			continue
 		}
-		log.Printf("[%s] Saved Metric to DB: %.2f", clientAddr, metric)
+		log.Printf("[%s], email: %s Saved Metric to DB: %.2f", clientAddr, email, metric)
 	}
 }
