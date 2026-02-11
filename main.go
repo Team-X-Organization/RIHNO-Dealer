@@ -153,7 +153,7 @@ type ConnectionDetail struct {
 func main() {
 	fmt.Println("Starting RIHNO Dealer on 127.0.0.1:8080")
 
-	connStr := "postgres://postgres:5001@192.168.1.10:5432/rihno_db"
+	connStr := "postgres://postgres:5001@192.168.1.10:5432/rihnodb"
 
 	dbpool, err := pgxpool.New(context.Background(), connStr)
 	if err != nil {
@@ -322,7 +322,7 @@ func insertMetrics(dbpool *pgxpool.Pool, agentID string, p *MetricsPayload) erro
 		$61,$62,$63,$64,$65,$66,$67,$68,$69,$70,
 		$71,$72,$73,$74,$75,$76,$77,$78,$79,$80,
 		$81,$82,$83,$84,$85,$86,$87,$88,$89,$90,
-		$91,$92,$93,$94,$95,$96,$97
+		$91,$92,$93,$94,$95,$96,$97,$98,$99
 	)`
 
 	_, err := dbpool.Exec(context.Background(), query,
@@ -422,13 +422,10 @@ func insertMetrics(dbpool *pgxpool.Pool, agentID string, p *MetricsPayload) erro
 		m.FailedConnectionRatio,     // $94
 		m.TotalIncomingConnections,  // $95
 		m.TotalOutgoingConnections,  // $96
-		m.UniqueIncomingIPs,         // $97 -- wait, we need 97 total but have more
-		// Let me recount...
+		m.UniqueIncomingIPs,         // $97
+		m.UniqueOutgoingIPs,         // $98
+		m.LocalIPsCount,             // $99
 	)
-
-	// Actually let me fix the parameter count. We have 97 columns total
-	// (time + agent_id + email + agent_name + agent_type + 92 metrics = 97)
-	// But we also have unique_outgoing_ips and local_ips_count = 97+2 = let me recount
 
 	return err
 }
