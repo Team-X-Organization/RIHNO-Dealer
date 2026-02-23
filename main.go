@@ -150,6 +150,24 @@ type ConnectionDetail struct {
 	IsSuspicious bool   `json:"is_suspicious"`
 }
 
+// ========== CORS MIDDLEWARE ==========
+
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// Handle preflight request
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // ========== MAIN ==========
 
 func main() {
@@ -171,8 +189,8 @@ func main() {
 	}
 	fmt.Println("Connected to TimescaleDB")
 
-	// 2. Register the route and pass the db pool
-	http.HandleFunc("/metrics/cpu", getSystemCPU(dbpool))
+	// 2. Register the route with CORS middleware
+	http.HandleFunc("/metrics/cpu", enableCORS(getSystemCPU(dbpool)))
 
 	// 3. Start the server
 	go func() {
