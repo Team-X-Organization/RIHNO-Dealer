@@ -10,11 +10,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -169,6 +171,17 @@ func main() {
 	}
 	fmt.Println("Connected to TimescaleDB")
 
+	// 2. Register the route and pass the db pool
+	http.HandleFunc("/metrics/cpu", getSystemCPU(dbpool))
+
+	// 3. Start the server
+	go func() {
+		fmt.Println("HTTP API Server starting on port 8000...")
+		if err := http.ListenAndServe(":8000", nil); err != nil {
+			log.Fatalf("HTTP Server failed to start: %v", err)
+		}
+	}()
+
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		log.Fatalf("Error listening on port 8080: %v", err)
@@ -185,6 +198,7 @@ func main() {
 		}
 		go handleConnection(conn, dbpool)
 	}
+
 }
 
 func handleConnection(conn net.Conn, dbpool *pgxpool.Pool) {
@@ -603,5 +617,57 @@ func checkAndInsertAlerts(dbpool *pgxpool.Pool, agentID string, p *MetricsPayloa
 			fmt.Sprintf("Failed connection ratio: %.3f (%d total connections)",
 				m.FailedConnectionRatio, m.TotalConnections),
 			"failed_connection_ratio", m.FailedConnectionRatio, 0.5)
+	}
+}
+
+type CPUResponse struct {
+	SystemCPU float64 `json:"system_cpu"`
+}
+
+func getSystemCPU(db *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// 1. Extract query parameters from the URL
+		email := r.URL.Query().Get("email")
+		deviceName := r.URL.Query().Get("device_name")
+
+		// 2. Validate that the required parameters were provided
+		if email == "" || deviceName == "" {
+			http.Error(w, "Missing required query parameters: 'email' and 'device_name'", http.StatusBadRequest)
+			return
+		}
+
+		// 3. Use $1 and $2 as placeholders to safely inject the variables
+		query := `
+			SELECT system_cpu 
+			FROM rihno_metrics 
+			WHERE email = $1 AND agent_name = $2
+			ORDER BY time DESC LIMIT 1;
+		`
+		var systemCPU float64
+
+		// 4. Pass the extracted variables into QueryRow
+		err := db.QueryRow(context.Background(), query, email, deviceName).Scan(&systemCPU)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				http.Error(w, "No data found for this device", http.StatusNotFound)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Unable to select data: %v\n", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		response := CPUResponse{SystemCPU: systemCPU}
+		w.Header().Set("Content-Type", "application/json")
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			http.Error(w, "Error encoding response", http.StatusInternalServerError)
+			return
+		}
 	}
 }
