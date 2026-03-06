@@ -172,9 +172,14 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 // ========== MAIN ==========
 
 func main() {
-	fmt.Println("Starting RIHNO Dealer on 127.0.0.1:8080")
+	fmt.Println("Starting Rihno Dealer...")
 
-	connStr := "postgres://postgres:5001@192.168.1.10:5432/rihnodb"
+	// 1. Connect to PostgreSQL/TimescaleDB
+	connStr := os.Getenv("DB_URL")
+	if connStr == "" {
+		connStr = "postgres://postgres:5001@192.168.1.10:5432/rihnodb"
+		log.Println("WARNING: DB_URL environment variable is not set. Falling back to default.")
+	}
 
 	dbpool, err := pgxpool.New(context.Background(), connStr)
 	if err != nil {
@@ -196,25 +201,37 @@ func main() {
 	http.HandleFunc("/metrics/history", enableCORS(getMetricsHistory(dbpool)))
 	http.HandleFunc("/metrics/network_map", enableCORS(getNetworkMap(dbpool)))
 	http.HandleFunc("/alerts/recent", enableCORS(getRecentAlerts(dbpool)))
+	http.HandleFunc("/agents/status", enableCORS(getAgentsStatus(dbpool)))
 
 	// 3. Start the server
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = "8000" // default for Frontend API
+	}
+
 	go func() {
-		fmt.Println("HTTP API Server starting on port 8000...")
-		if err := http.ListenAndServe(":8000", nil); err != nil {
-			log.Fatalf("HTTP Server failed to start: %v", err)
+		log.Printf("Starting HTTP server on :%s (Metrics API)", httpPort)
+		if err := http.ListenAndServe(":"+httpPort, nil); err != nil {
+			log.Fatalf("HTTP server failed: %v", err)
 		}
 	}()
 
-	ln, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		log.Fatalf("Error listening on port 8080: %v", err)
+	// 4. Start listening on TCP port
+	tcpPort := os.Getenv("TCP_PORT")
+	if tcpPort == "" {
+		tcpPort = "8080" // default for raw agent connections
 	}
-	defer ln.Close()
 
-	log.Println("Dealer ready. Waiting for agents...")
+	listener, err := net.Listen("tcp", ":"+tcpPort)
+	if err != nil {
+		log.Fatalf("Error listening: %v", err)
+	}
+	defer listener.Close()
+
+	fmt.Printf("Dealer listening on :%s for agent connections...\n", tcpPort)
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Error accepting connection: %v", err)
 			continue
@@ -227,11 +244,15 @@ func main() {
 func handleConnection(conn net.Conn, dbpool *pgxpool.Pool) {
 	atomic.AddInt32(&activeAgents, 1)
 	clientAddr := conn.RemoteAddr().String()
+	var connectedAgentName string
 
 	defer func() {
 		conn.Close()
 		atomic.AddInt32(&activeAgents, -1)
 		log.Printf("[%s] Agent disconnected. Active: %d", clientAddr, atomic.LoadInt32(&activeAgents))
+		if dbpool != nil && connectedAgentName != "" {
+			dbpool.Exec(context.Background(), "UPDATE rihno_agents SET is_active = false WHERE agent_name = $1", connectedAgentName)
+		}
 	}()
 
 	log.Printf("[%s] New agent connected. Active: %d", clientAddr, atomic.LoadInt32(&activeAgents))
@@ -281,6 +302,8 @@ func handleConnection(conn net.Conn, dbpool *pgxpool.Pool) {
 		if err := insertConnections(dbpool, clientAddr, &payload); err != nil {
 			log.Printf("[%s] DB connections insert error: %v", clientAddr, err)
 		}
+
+		connectedAgentName = payload.AgentName
 
 		// Update agent registry
 		if err := upsertAgent(dbpool, clientAddr, &payload); err != nil {
@@ -525,7 +548,7 @@ type pgxBatch struct{}
 
 func (b *pgxBatch) Queue(query string, args ...interface{}) {}
 
-func upsertAgent(dbpool *pgxpool.Pool, agentID string, p *MetricsPayload) error {
+func upsertAgent(dbpool *pgxpool.Pool, clientIP string, p *MetricsPayload) error {
 	query := `
 	INSERT INTO rihno_agents (agent_id, agent_name, agent_type, email, first_seen, last_seen, is_active, ip_address)
 	VALUES ($1, $2, $3, $4, NOW(), NOW(), TRUE, $5)
@@ -533,10 +556,11 @@ func upsertAgent(dbpool *pgxpool.Pool, agentID string, p *MetricsPayload) error 
 		last_seen = NOW(),
 		is_active = TRUE,
 		agent_name = EXCLUDED.agent_name,
-		agent_type = EXCLUDED.agent_type`
+		agent_type = EXCLUDED.agent_type,
+		ip_address = EXCLUDED.ip_address`
 
 	_, err := dbpool.Exec(context.Background(), query,
-		agentID, p.AgentName, p.AgentType, p.Email, agentID)
+		p.AgentName, p.AgentName, p.AgentType, p.Email, clientIP)
 	return err
 }
 
@@ -1226,6 +1250,52 @@ func getMetricsHistory(db *pgxpool.Pool) http.HandlerFunc {
 		if err := json.NewEncoder(w).Encode(history); err != nil {
 			fmt.Fprintf(os.Stderr, "JSON encoding error: %v\n", err)
 		}
+	}
+}
+
+// ========== AGENT STATUS HTTP HANDLER ==========
+
+type AgentStatus struct {
+	AgentName string    `json:"agent_name"`
+	IsActive  bool      `json:"is_active"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+func getAgentsStatus(dbpool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		email := r.URL.Query().Get("email")
+		if email == "" {
+			http.Error(w, "email parameter is required", http.StatusBadRequest)
+			return
+		}
+
+		query := `
+			SELECT agent_name, is_active, last_seen
+			FROM rihno_agents
+			WHERE email = $1
+		`
+
+		rows, err := dbpool.Query(context.Background(), query, email)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("database query failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var statuses []AgentStatus
+		for rows.Next() {
+			var s AgentStatus
+			if err := rows.Scan(&s.AgentName, &s.IsActive, &s.LastSeen); err == nil {
+				// Safety check: if last_seen > 2m, consider offline regardless of what DB says
+				if time.Since(s.LastSeen) > 2*time.Minute {
+					s.IsActive = false
+				}
+				statuses = append(statuses, s)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(statuses)
 	}
 }
 
