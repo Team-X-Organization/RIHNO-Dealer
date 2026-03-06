@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -193,6 +194,8 @@ func main() {
 	http.HandleFunc("/metrics/cpu", enableCORS(getSystemCPU(dbpool)))
 	http.HandleFunc("/metrics/latest_full", enableCORS(getLatestFullMetrics(dbpool)))
 	http.HandleFunc("/metrics/history", enableCORS(getMetricsHistory(dbpool)))
+	http.HandleFunc("/metrics/network_map", enableCORS(getNetworkMap(dbpool)))
+	http.HandleFunc("/alerts/recent", enableCORS(getRecentAlerts(dbpool)))
 
 	// 3. Start the server
 	go func() {
@@ -1195,16 +1198,21 @@ func getMetricsHistory(db *pgxpool.Pool) http.HandlerFunc {
 			}
 
 			switch {
-			case normalized > 89:
+			case normalized > 90:
+				level = 5
+			case normalized > 75:
 				level = 4
-			case normalized > 70:
+			case normalized > 50:
 				level = 3
-			case normalized > 40:
+			case normalized > 25:
 				level = 2
-			case normalized > 20:
+			case normalized > 0:
 				level = 1
+			default:
+				level = 0
 			}
 
+			// Restore formatting logic since HistoryPoint struct demands a string, not time.Time
 			history = append(history, HistoryPoint{
 				Date:  row.date.Format(rc.dateFormat),
 				Count: count,
@@ -1215,6 +1223,117 @@ func getMetricsHistory(db *pgxpool.Pool) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(history)
+		if err := json.NewEncoder(w).Encode(history); err != nil {
+			fmt.Fprintf(os.Stderr, "JSON encoding error: %v\n", err)
+		}
+	}
+}
+
+// ========== ALERTS HTTP HANDLER ==========
+
+type AlertRecord struct {
+	Time        time.Time `json:"time"`
+	AgentID     string    `json:"agent_id"`
+	AgentName   string    `json:"agent_name"`
+	AlertType   string    `json:"alert_type"`
+	Severity    string    `json:"severity"`
+	Description string    `json:"description"`
+	MetricName  string    `json:"metric_name"`
+	MetricValue float64   `json:"metric_value"`
+	Threshold   float64   `json:"threshold"`
+}
+
+func getRecentAlerts(dbpool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		email := r.URL.Query().Get("email")
+		if email == "" {
+			http.Error(w, "email parameter is required", http.StatusBadRequest)
+			return
+		}
+
+		// Pagination parameters
+		limitStr := r.URL.Query().Get("limit")
+		limit := 100 // Default limit
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
+				limit = l
+			}
+		}
+
+		query := `
+			SELECT time, agent_id, agent_name, alert_type, severity, description, metric_name, metric_value, threshold
+			FROM rihno_alerts
+			WHERE email = $1
+			ORDER BY time DESC
+			LIMIT $2
+		`
+
+		rows, err := dbpool.Query(context.Background(), query, email, limit)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("database query failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var alerts []AlertRecord
+		for rows.Next() {
+			var a AlertRecord
+			err := rows.Scan(
+				&a.Time, &a.AgentID, &a.AgentName, &a.AlertType, &a.Severity,
+				&a.Description, &a.MetricName, &a.MetricValue, &a.Threshold,
+			)
+			if err != nil {
+				log.Printf("Error scanning back alert row: %v", err)
+				continue
+			}
+			alerts = append(alerts, a)
+		}
+
+		if err := rows.Err(); err != nil {
+			http.Error(w, fmt.Sprintf("row iteration failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(alerts)
+	}
+}
+
+// ========== NETWORK MAP HANDLER ==========
+
+func getNetworkMap(dbpool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		email := r.URL.Query().Get("email")
+		deviceName := r.URL.Query().Get("device_name")
+
+		if email == "" || deviceName == "" {
+			http.Error(w, "Missing email or device_name parameter", http.StatusBadRequest)
+			return
+		}
+
+		query := `
+			SELECT network_map_json
+			FROM rihno_network_maps
+			WHERE email = $1 AND agent_name = $2
+			ORDER BY time DESC
+			LIMIT 1;
+		`
+
+		var networkMapJSON []byte
+		err := dbpool.QueryRow(context.Background(), query, email, deviceName).Scan(&networkMapJSON)
+
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte("null"))
+				return
+			}
+			fmt.Fprintf(os.Stderr, "getNetworkMap query error: %v\n", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(networkMapJSON)
 	}
 }
