@@ -177,7 +177,7 @@ func main() {
 	// 1. Connect to PostgreSQL/TimescaleDB
 	connStr := os.Getenv("DB_URL")
 	if connStr == "" {
-		connStr = "postgres://postgres:5051@localhost:5432/rihnodb"
+		connStr = "postgres://postgres:5001@my_rihno_db:5432/rihnodb?sslmode=disable"
 		log.Println("WARNING: DB_URL environment variable is not set. Falling back to default.")
 	}
 
