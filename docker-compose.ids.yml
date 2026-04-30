@@ -1,0 +1,54 @@
+# ─── Add these services to your existing docker-compose.yml ───────────────────
+#
+# This adds:
+#   1. my_rihno_redis     — Redis server for the IDS AI pipeline
+#   2. my_rihno_ids       — Python IDS Zero-Day Detection API
+#
+# Your existing services (my_rihno_db, my_rihno_kafka, dealer) remain unchanged.
+# The dealer now writes to Redis IN ADDITION to PostgreSQL and Kafka.
+
+services:
+
+  # ── Your existing dealer (updated with Redis pipeline) ───────────────────────
+  dealer:
+    build: ./dealer
+    ports:
+      - "8000:8000"   # HTTP API
+      - "8080:8080"   # TCP agent listener
+    environment:
+      - DB_URL=postgres://postgres:5001@my_rihno_db:5432/rihnodb?sslmode=disable
+      - REDIS_HOST=my_rihno_redis
+      - REDIS_PORT=6379
+    depends_on:
+      - my_rihno_db
+      - my_rihno_kafka
+      - my_rihno_redis       # ← NEW dependency
+
+  # ── Redis for IDS AI Pipeline ────────────────────────────────────────────────
+  my_rihno_redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── IDS Zero-Day Detection API (Python) ──────────────────────────────────────
+  my_rihno_ids:
+    build: ./ids_zero_day
+    ports:
+      - "8001:8000"          # IDS API on host port 8001
+    environment:
+      - REDIS_HOST=my_rihno_redis
+      - REDIS_PORT=6379
+    depends_on:
+      my_rihno_redis:
+        condition: service_healthy
+
+volumes:
+  redis_data:
