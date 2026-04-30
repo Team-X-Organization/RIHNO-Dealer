@@ -262,6 +262,10 @@ func main() {
 	defer kafkaWriter.Close()
 	log.Printf("Kafka writer initialized for topic '%s' at %v", kafkaTopic, kafkaBrokers)
 
+	// Initialize Redis Client (for IDS AI backend pipeline)
+	redisClient = initRedisClient()
+	defer redisClient.Close()
+
 	// 1. Connect to PostgreSQL/TimescaleDB
 	connStr := os.Getenv("DB_URL")
 	if connStr == "" {
@@ -385,6 +389,12 @@ func handleConnection(conn net.Conn, dbpool *pgxpool.Pool) {
 		if err := sendToKafka(&payload); err != nil {
 			log.Printf("[%s] Kafka send error: %v", clientAddr, err)
 			// Don't continue here - we want to proceed even if Kafka fails
+		}
+
+		// ========== REDIS INTEGRATION: Send to Redis for IDS AI backend ==========
+		if err := sendToRedis(&payload); err != nil {
+			log.Printf("[%s] Redis send error: %v", clientAddr, err)
+			// Non-blocking: Redis failure should not stop other pipelines
 		}
 
 		// Insert network map

@@ -8,6 +8,7 @@ WORKDIR /app
 
 # Copy source and initialise the module
 COPY main.go .
+COPY redis_pipeline.go .
 
 # Bootstrap go.mod + go.sum, then tidy to pull all dependencies
 RUN go mod init dealer && \
@@ -35,7 +36,11 @@ EXPOSE 8000 8080
 # ── Environment defaults ─────────────────────────────────────────────────────
 ENV HTTP_PORT=8000 \
     TCP_PORT=8080 \
-    DB_URL=""
+    DB_URL="" \
+    REDIS_HOST="my_rihno_redis" \
+    REDIS_PORT="6379" \
+    REDIS_PASS="" \
+    REDIS_DB="0"
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 ENTRYPOINT ["./dealer"]
